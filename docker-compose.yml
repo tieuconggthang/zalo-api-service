@@ -1,0 +1,29 @@
+services:
+  zalo-api:
+    build: .
+    container_name: zalo-api-service
+    ports:
+      - "10000:10000"
+    volumes:
+      - ./data:/app/data
+      - ./openzca_data:/root/.openzca  # Mount session openzca
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - HERMES_HOME=/app/data
+      - ZALO_SESSION=/app/data/zalo_session.json
+      - NODE_NO_WARNINGS=1
+      - PORT=10000
+      - HOST=0.0.0.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - zalo-network
+
+networks:
+  zalo-network:
+    driver: bridge
