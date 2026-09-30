@@ -116,33 +116,124 @@ def run_bridge(method: str, args=None, timeout: int = 30):
 # ============================================================================
 
 def run_openzca_cmd(args: list, timeout: int = 30) -> Dict:
-    """Run openzca CLI command"""
+    """Run openzca CLI command — fallback to zalo-api-bridge.js if login fails"""
     cmd = ["openzca"] + args
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
             cwd=str(DATA_DIR)
         )
+        # Nếu openzca báo lỗi login → dùng bridge
+        err = result.stderr.strip() or ""
+        out = result.stdout.strip() or ""
+        if "Đăng nhập thất bại" in err or "login" in err.lower() or result.returncode != 0:
+            bridge_result = run_bridge_cmd(args)
+            if bridge_result.get("success"):
+                return bridge_result
         if result.returncode != 0:
-            return {"success": False, "error": result.stderr.strip() or result.stdout.strip()}
+            return {"success": False, "error": err or out}
         try:
-            data = json.loads(result.stdout.strip())
+            data = json.loads(out)
             return {"success": True, "data": data}
         except json.JSONDecodeError:
-            # Nếu không phải JSON, trả về raw output
-            return {"success": True, "data": result.stdout.strip()}
+            return {"success": True, "data": out}
     except subprocess.TimeoutExpired:
         return {"success": False, "error": f"Timeout after {timeout}s"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def check_session():
-    """Check if valid session exists using openzca"""
-    result = run_openzca_cmd(["me", "id"], timeout=10)
+def run_bridge_cmd(args: list, timeout: int = 30) -> Dict:
+    """Run zalo-api-bridge.js using the correct zalo_session.json"""
+    bridge_script = PLUGIN_DIR / "zalo-api-bridge.js"
+    method = None
+    bridge_args = None
     
+    # Map openzca CLI args → bridge method
+    if args[0] == "me" and args[1] == "id":
+        method = "getOwnId"
+    elif args[0] == "me" and args[1] == "info":
+        method = "fetchAccountInfo"
+    elif args[0] == "friend" and args[1] == "list":
+        method = "getAllFriends"
+    elif args[0] == "group" and args[1] == "list":
+        method = "getAllGroups"
+    elif args[0] == "msg" and args[1] == "send":
+        # openzca: msg send <user_id> <message> [-g]
+        method = "sendTextMessage"
+        user_id = args[2]
+        message = args[3] if len(args) > 3 else ""
+        is_group = "-g" in args
+        bridge_args = [message, user_id, 1 if is_group else 0]
+    elif args[0] == "msg" and args[1] == "image":
+        # openzca: msg image <user_id> -u <url> -m <caption>
+        method = "sendImage"
+        user_id = args[2]
+        image_url = ""
+        caption = ""
+        for i, a in enumerate(args):
+            if a == "-u" and i+1 < len(args):
+                image_url = args[i+1]
+            if a == "-m" and i+1 < len(args):
+                caption = args[i+1]
+        bridge_args = [image_url, user_id, caption]
+    else:
+        return {"success": False, "error": f"Unknown bridge mapping for: {args}"}
+    
+    cmd = ["node", str(bridge_script), method]
+    if bridge_args is not None:
+        cmd.append(json.dumps(bridge_args, ensure_ascii=False))
+    
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            cwd=str(PLUGIN_DIR),
+            env={**os.environ, "ZALO_SESSION": str(SESSION_FILE), "NODE_NO_WARNINGS": "1"}
+        )
+        if result.returncode != 0:
+            return {"success": False, "error": result.stderr.strip() or result.stdout.strip()}
+        try:
+            data = json.loads(result.stdout.strip().split('\n')[-1])
+            return {"success": True, "data": data}
+        except:
+            return {"success": True, "data": result.stdout.strip()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def check_session():
+    """Check if valid session exists (zalo_session.json from zalo-qr-login.js)"""
+    # Kiểm tra session file từ zalo-qr-login.js
+    if SESSION_FILE.exists():
+        try:
+            with open(SESSION_FILE, "r") as f:
+                session = json.load(f)
+            if session.get("uid") and session.get("cookies"):
+                # Check if session is not too old (30 days)
+                saved = session.get("savedAt", "")
+                if saved:
+                    from datetime import datetime, timezone
+                    try:
+                        saved_dt = datetime.fromisoformat(saved.replace("Z", "+00:00"))
+                        age = datetime.now(timezone.utc) - saved_dt
+                        if age.days < 30:
+                            zalo_state["is_logged_in"] = True
+                            zalo_state["user_info"] = {
+                                "uid": session.get("uid"),
+                                "name": session.get("name", ""),
+                                "phone": session.get("phone", "")
+                            }
+                            return True
+                    except:
+                        pass
+                else:
+                    zalo_state["is_logged_in"] = True
+                    return True
+        except:
+            pass
+    
+    # Fallback: try openzca CLI
+    result = run_openzca_cmd(["me", "id"], timeout=10)
     if result.get("success") and result.get("data"):
         zalo_state["is_logged_in"] = True
-        # Get profile info
         profile_result = run_openzca_cmd(["me", "info", "-j"], timeout=10)
         if profile_result.get("success"):
             profile = profile_result.get("data", {})
@@ -157,17 +248,14 @@ def check_session():
     return False
 
 def find_user_by_phone(phone: str) -> Optional[Dict]:
-    """Find user by phone number using openzca CLI"""
-    # Remove + prefix if present for comparison
+    """Find user by phone number using zalo-api-bridge.js"""
     phone_clean = phone.replace("+", "")
     
-    # List all friends using JSON format
-    result = run_openzca_cmd(["friend", "list", "-j"], timeout=15)
+    # Use bridge directly (bypass openzca CLI session issues)
+    result = run_bridge_cmd(["friend", "list", "-j"], timeout=15)
     if result.get("success") and result.get("data"):
         friends = result.get("data", [])
-        # Handle both list and dict formats
         if isinstance(friends, dict):
-            # If returned as dict with userId as keys
             for uid, friend in friends.items():
                 friend_phone = str(friend.get("phoneNumber", "")).replace("+", "")
                 if friend_phone == phone_clean or friend_phone.endswith(phone_clean):
@@ -176,7 +264,6 @@ def find_user_by_phone(phone: str) -> Optional[Dict]:
                         "name": friend.get("name", "Unknown")
                     }
         elif isinstance(friends, list):
-            # If returned as list
             for friend in friends:
                 friend_phone = str(friend.get("phoneNumber") or friend.get("phone") or "").replace("+", "")
                 if friend_phone == phone_clean or friend_phone.endswith(phone_clean):
@@ -187,8 +274,8 @@ def find_user_by_phone(phone: str) -> Optional[Dict]:
     return None
 
 def find_group_by_name(name: str) -> Optional[Dict]:
-    """Find group by name using openzca CLI"""
-    result = run_openzca_cmd(["group", "list", "-j"], timeout=15)
+    """Find group by name using zalo-api-bridge.js"""
+    result = run_bridge_cmd(["group", "list", "-j"], timeout=15)
     if result.get("success") and result.get("data"):
         groups = result.get("data", [])
         name_lower = name.lower()
@@ -201,49 +288,29 @@ def find_group_by_name(name: str) -> Optional[Dict]:
     return None
 
 def send_message_to_user(user_id: str, message: str, image_url: Optional[str] = None) -> Dict:
-    """Send message to user using openzca CLI"""
+    """Send message to user using zalo-api-bridge.js"""
     if image_url:
-        result = run_openzca_cmd([
+        result = run_bridge_cmd([
             "msg", "image", str(user_id),
             "-u", image_url,
             "-m", message
         ], timeout=20)
     else:
-        result = run_openzca_cmd(["msg", "send", str(user_id), message], timeout=15)
+        result = run_bridge_cmd(["msg", "send", str(user_id), message], timeout=15)
     return result
 
 def send_message_to_group(group_id: str, message: str, image_url: Optional[str] = None) -> Dict:
-    """Send message to group using openzca CLI"""
+    """Send message to group using zalo-api-bridge.js"""
     if image_url:
-        result = run_openzca_cmd([
+        result = run_bridge_cmd([
             "msg", "image", str(group_id),
             "-u", image_url,
             "-m", message,
             "-g"
         ], timeout=20)
     else:
-        result = run_openzca_cmd(["msg", "send", str(group_id), message, "-g"], timeout=15)
+        result = run_bridge_cmd(["msg", "send", str(group_id), message, "-g"], timeout=15)
     return result
-
-# Helper function to run openzca CLI
-def run_openzca_cmd(args: list, timeout: int = 30) -> Dict:
-    """Run openzca CLI command"""
-    import subprocess
-    cmd = ["openzca"] + args
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            cwd=str(DATA_DIR)
-        )
-        if result.returncode != 0:
-            return {"success": False, "error": result.stderr.strip() or result.stdout.strip()}
-        try:
-            data = json.loads(result.stdout.strip())
-            return {"success": True, "data": data}
-        except json.JSONDecodeError:
-            return {"success": True, "data": result.stdout.strip()}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 # ============================================================================
 # API Endpoints
@@ -458,32 +525,37 @@ async def get_qr_login():
     zalo_state["qr_created_at"] = time.time()
     
     async def generate_qr():
-        """Generate QR using openzca and copy to web location"""
+        """Generate QR using zalo-qr-login.js (no xdg-open crash)"""
         try:
+            import shutil
             # Xóa QR cũ
             if QR_FILE.exists():
                 QR_FILE.unlink()
+            if os.path.exists("/app/qr.png"):
+                os.remove("/app/qr.png")
             
-            # Chạy openzca login (tạo qr.png)
+            # Chạy zalo-qr-login.js thay vì openzca (tránh lỗi xdg-open trong container)
             proc = await asyncio.create_subprocess_exec(
-                "openzca", "auth", "login",
+                "node", "/app/zalo_plugin/zalo-qr-login.js",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd="/app"  # openzca lưu qr.png tại /app
+                stderr=asyncio.subprocess.PIPE,
+                cwd="/app"
             )
             
             zalo_state["login_process"] = proc
             stdout, stderr = await proc.communicate()
-            output = (stdout or b'').decode()
+            out = (stdout or b'').decode()
+            err = (stderr or b'').decode()
             
-            print(f"[openzca] {output}")
+            print(f"[qr-login stdout] {out}")
+            print(f"[qr-login stderr] {err}")
             
-            # Copy qr.png sang vị trí web đọc
-            import shutil
-            source_qr = Path("/app/qr.png")
-            if source_qr.exists():
-                shutil.copy(str(source_qr), str(QR_FILE))
-                print(f"📷 QR copied to {QR_FILE}")
+            # Copy QR sang vị trí web
+            for src in ["/app/data/qr_code.png", "/app/qr.png"]:
+                if os.path.exists(src):
+                    shutil.copy(src, str(QR_FILE))
+                    print(f"📷 QR copied to {QR_FILE}")
+                    break
             
             if proc.returncode == 0:
                 zalo_state["is_logged_in"] = True
@@ -549,22 +621,27 @@ async def refresh_qr():
         
         async def generate_new_qr():
             try:
+                import shutil
                 proc = await asyncio.create_subprocess_exec(
-                    "openzca", "auth", "login",
+                    "node", "/app/zalo_plugin/zalo-qr-login.js",
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
+                    stderr=asyncio.subprocess.PIPE,
                     cwd="/app"
                 )
                 
                 zalo_state["login_process"] = proc
-                stdout, _ = await proc.communicate()
-                print(f"[openzca] {stdout.decode()}")
+                stdout, stderr = await proc.communicate()
+                out = (stdout or b'').decode()
+                err = (stderr or b'').decode()
+                print(f"[qr-login stdout] {out}")
+                print(f"[qr-login stderr] {err}")
                 
                 # Copy QR file
-                import shutil
-                if os.path.exists("/app/qr.png"):
-                    shutil.copy("/app/qr.png", str(QR_FILE))
-                    print(f"📷 QR saved to {QR_FILE}")
+                for src in ["/app/data/qr_code.png", "/app/qr.png"]:
+                    if os.path.exists(src):
+                        shutil.copy(src, str(QR_FILE))
+                        print(f"📷 QR saved to {QR_FILE}")
+                        break
                 
                 if proc.returncode == 0:
                     zalo_state["is_logged_in"] = True
@@ -762,6 +839,11 @@ class SendImageToUserRequest(BaseModel):
     image_url: str = Field(..., description="Image URL to send")
     caption: str = Field("", description="Caption text")
 
+class SendImageByPhoneRequest(BaseModel):
+    phone: str = Field(..., description="Phone number")
+    image_url: str = Field(..., description="Image URL to send")
+    caption: str = Field("", description="Caption text")
+
 @app.post("/send-to-user", response_model=ApiResponse)
 async def send_to_user_direct(request: SendToUserRequest):
     """Send text message directly to user_id (no phone lookup)"""
@@ -825,9 +907,20 @@ async def send_image_to_user_direct(request: SendImageToUserRequest):
     if not check_session():
         raise HTTPException(401, "Not logged in")
     
+    # Decode URL nếu bị double encoded (fix Java double encoding)
+    import urllib.parse
+    image_url = urllib.parse.unquote(request.image_url)
+    # Nếu vẫn còn %XX sau unquote, có thể bị encode 2 lần, thử unquote lần nữa
+    if '%' in image_url and '%25' not in request.image_url:
+        # Đã decode đúng, giữ nguyên
+        pass
+    elif '%25' in request.image_url:
+        # Double encoded, decode lần nữa
+        image_url = urllib.parse.unquote(image_url)
+    
     result = run_openzca_cmd([
         "msg", "image", request.user_id,
-        "-u", request.image_url,
+        "-u", image_url,
         "-m", request.caption
     ], timeout=20)
     
@@ -836,6 +929,41 @@ async def send_image_to_user_direct(request: SendImageToUserRequest):
             success=True,
             message=f"Image sent to user {request.user_id}",
             data={"user_id": request.user_id}
+        )
+    else:
+        return ApiResponse(
+            success=False,
+            message="Failed to send image",
+            data={"error": result.get("error")}
+        )
+
+@app.post("/send-image-json", response_model=ApiResponse)
+async def send_image_by_phone_json(request: SendImageByPhoneRequest):
+    """Send image by phone number using JSON body (tránh lỗi URL encoding)"""
+    if not check_session():
+        raise HTTPException(401, "Not logged in")
+    
+    # Tìm user từ phone
+    user = find_user_by_phone(request.phone)
+    if not user:
+        return ApiResponse(
+            success=False,
+            message=f"User not found with phone: {request.phone}"
+        )
+    
+    # Decode URL nếu bị double encoded
+    import urllib.parse
+    image_url = urllib.parse.unquote(request.image_url)
+    if '%25' in request.image_url:
+        image_url = urllib.parse.unquote(image_url)
+    
+    result = send_message_to_user(user["id"], request.caption, image_url)
+    
+    if result.get("success"):
+        return ApiResponse(
+            success=True,
+            message=f"Image sent to {user.get('name', request.phone)}",
+            data={"user_id": user["id"], "user_name": user.get("name")}
         )
     else:
         return ApiResponse(
