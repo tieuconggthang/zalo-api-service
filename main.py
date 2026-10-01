@@ -844,6 +844,11 @@ class SendImageByPhoneRequest(BaseModel):
     image_url: str = Field(..., description="Image URL to send")
     caption: str = Field("", description="Caption text")
 
+class SendImageBase64Request(BaseModel):
+    phone: str = Field(..., description="Phone number")
+    image_base64: str = Field(..., description="Base64 encoded PNG image")
+    caption: str = Field("", description="Caption text")
+
 @app.post("/send-to-user", response_model=ApiResponse)
 async def send_to_user_direct(request: SendToUserRequest):
     """Send text message directly to user_id (no phone lookup)"""
@@ -973,18 +978,58 @@ async def send_image_by_phone_json(request: SendImageByPhoneRequest):
         )
 
 # ============================================================================
-# Static Images (shared with fee service templates)
+# Base64 Image Endpoint (works across different machines, no shared volume)
 # ============================================================================
 
-from fastapi import Path as FastApiPath
+@app.post("/send-image-base64", response_model=ApiResponse)
+async def send_image_base64(request: SendImageBase64Request):
+    """Send image from base64 string (no shared volume needed)"""
+    if not check_session():
+        raise HTTPException(401, "Not logged in")
 
-@app.get("/images/{filename}")
-async def get_image(filename: str = FastApiPath(...)):
-    """Serve fee notification images from shared volume"""
-    image_path = Path("/app/data/images") / filename
-    if image_path.exists():
-        return FileResponse(image_path, media_type="image/png")
-    raise HTTPException(404, "Image not found")
+    user = find_user_by_phone(request.phone)
+    if not user:
+        return ApiResponse(
+            success=False,
+            message=f"User not found with phone: {request.phone}"
+        )
+
+    try:
+        import base64
+        # Decode base64
+        image_data = base64.b64decode(request.image_base64)
+
+        # Save to temp file
+        temp_file = DATA_DIR / f"base64_image_{int(time.time())}.png"
+        with open(temp_file, "wb") as f:
+            f.write(image_data)
+
+        # Send via bridge
+        result = send_message_to_user(user["id"], request.caption, str(temp_file))
+
+        # Cleanup
+        try:
+            temp_file.unlink()
+        except:
+            pass
+
+        if result.get("success"):
+            return ApiResponse(
+                success=True,
+                message=f"Image sent to {user.get('name', request.phone)}",
+                data={"user_id": user["id"], "user_name": user.get("name")}
+            )
+        else:
+            return ApiResponse(
+                success=False,
+                message="Failed to send image",
+                data={"error": result.get("error")}
+            )
+    except Exception as e:
+        return ApiResponse(
+            success=False,
+            message=f"Error processing base64 image: {str(e)}"
+        )
 
 # ============================================================================
 # Data Endpoints
