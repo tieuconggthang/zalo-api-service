@@ -973,6 +973,20 @@ async def send_image_by_phone_json(request: SendImageByPhoneRequest):
         )
 
 # ============================================================================
+# Static Images (shared with fee service templates)
+# ============================================================================
+
+from fastapi import Path as FastApiPath
+
+@app.get("/images/{filename}")
+async def get_image(filename: str = FastApiPath(...)):
+    """Serve fee notification images from shared volume"""
+    image_path = Path("/app/data/images") / filename
+    if image_path.exists():
+        return FileResponse(image_path, media_type="image/png")
+    raise HTTPException(404, "Image not found")
+
+# ============================================================================
 # Data Endpoints
 # ============================================================================
 
