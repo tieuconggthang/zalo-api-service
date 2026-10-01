@@ -1004,8 +1004,8 @@ async def send_image_base64(request: SendImageBase64Request):
         with open(temp_file, "wb") as f:
             f.write(image_data)
 
-        # Send via bridge
-        result = send_message_to_user(user["id"], request.caption, str(temp_file))
+        # Send via bridge using file:// URL so bridge reads local file
+        result = send_message_to_user(user["id"], request.caption, f"file://{temp_file}")
 
         # Cleanup
         try:
